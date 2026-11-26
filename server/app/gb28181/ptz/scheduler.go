@@ -584,6 +584,9 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time) error {
 		// 配置读取的静止收敛：设备少回几条时不能干等到 transport deadline,
 		// 否则"设备不支持这些类型"（正确的 type_absent 结论）会被误报成超时。
 		schedulerStep{name: "settle_config_read_stages", run: s.service.settleConfigReadStages},
+		// 历史 PTZ 父意图：业务行已经终态，但父行仍停在 dispatched。
+		// 放在本轮判死之后，超时改写过的行同一拍就能结清。
+		schedulerStep{name: "settle_ptz_intents", run: s.settleDispatchedPTZIntents},
 	)
 
 	var firstErr error
@@ -708,6 +711,22 @@ func (s *Scheduler) expireQueued(ctx context.Context, now time.Time) error {
 	return firstErr
 }
 
+func (s *Scheduler) settleDispatchedPTZIntents(ctx context.Context, now time.Time) error {
+	if s == nil || s.service == nil || s.service.intents == nil || s.db == nil {
+		return nil
+	}
+	for round := 0; round < schedulerExpireRounds; round++ {
+		examined, err := playauth.BackfillSettledPTZIntents(ctx, ptzWriter(s.db), now, schedulerExpireChunk)
+		if err != nil {
+			return err
+		}
+		if examined < schedulerExpireChunk {
+			return nil
+		}
+	}
+	return nil
+}
+
 func (s *Scheduler) expireTransport(ctx context.Context, now time.Time) error {
 	return s.expireByPrimaryKey(ctx, now, schedulerExpiry{
 		from: gbmodels.PTZOperationQueued, to: gbmodels.PTZOperationUnknown,
@@ -742,14 +761,20 @@ func (s *Scheduler) expireByPrimaryKey(ctx context.Context, now time.Time, expir
 			return err
 		}
 		for _, id := range ids {
-			if err := ptzWriter(s.db).WithContext(ctx).Model(&gbmodels.GbPTZOperation{}).
+			result := ptzWriter(s.db).WithContext(ctx).Model(&gbmodels.GbPTZOperation{}).
 				Where("id = ? AND response_required = ? AND status = ? AND "+expiry.deadlineColumn+" IS NOT NULL AND "+expiry.deadlineColumn+" <= ?",
 					id, true, expiry.from, gbmodels.PTZTimeComparison(s.db, now)).
 				Updates(map[string]interface{}{
 					"status": expiry.to, "error_code": expiry.errorCode,
 					"error_message": expiry.errorMessage, "completed_at": now, "next_attempt_at": nil,
-				}).Error; err != nil {
-				return err
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 1 && s.service != nil && s.service.intents != nil {
+				if err := playauth.SettlePTZParent(ptzWriter(s.db).WithContext(ctx), id, now); err != nil {
+					return err
+				}
 			}
 		}
 		if len(ids) < schedulerExpireChunk {
@@ -804,12 +829,17 @@ func (s *Scheduler) recoverExpiredLeases(ctx context.Context, now time.Time) err
 			// 没有剩余重试槽位时必须收敛 operation 终态:否则 attempt==max_attempts
 			// 且 next_attempt_at==nil,claimDue 永远跳过,API 轮询永久停在未完成
 			if operation.MaxAttempts <= 1 || operation.Attempt >= operation.MaxAttempts {
-				return tx.Model(&gbmodels.GbPTZOperation{}).
+				if err := tx.Model(&gbmodels.GbPTZOperation{}).
 					Where("id = ? AND response_required = ? AND status = ?", operation.ID, true, gbmodels.PTZOperationQueued).
 					Updates(map[string]interface{}{
 						"status": gbmodels.PTZOperationUnknown, "error_code": schedulerErrorTransportUnknown,
 						"error_message": "PTZ MESSAGE 传输结果不确定", "completed_at": now, "next_attempt_at": nil,
-					}).Error
+					}).Error; err != nil {
+					return err
+				}
+			}
+			if s.service != nil && s.service.intents != nil {
+				return playauth.SettlePTZParent(tx, operation.ID, now)
 			}
 			return nil
 		}); err != nil {
@@ -894,9 +924,15 @@ func (s *Scheduler) revokeOperation(ctx context.Context, expected gbmodels.GbPTZ
 		if uncertain != 0 || expected.Status == gbmodels.PTZOperationSent || ((expected.DeviceEpoch == nil || expected.DeviceIntentID == nil) && expected.Attempt > 0) {
 			status = gbmodels.PTZOperationUnknown
 		}
-		return tx.Model(&gbmodels.GbPTZOperation{}).
+		if err := tx.Model(&gbmodels.GbPTZOperation{}).
 			Where("id = ? AND attempt = ? AND status = ?", expected.ID, expected.Attempt, expected.Status).
-			Updates(map[string]any{"status": status, "error_code": "DEVICE_EPOCH_REVOKED", "error_message": "原设备授权已失效", "next_attempt_at": nil, "completed_at": now}).Error
+			Updates(map[string]any{"status": status, "error_code": "DEVICE_EPOCH_REVOKED", "error_message": "原设备授权已失效", "next_attempt_at": nil, "completed_at": now}).Error; err != nil {
+			return err
+		}
+		if s.service != nil && s.service.intents != nil {
+			return playauth.SettlePTZParent(tx, expected.ID, now)
+		}
+		return nil
 	})
 }
 
@@ -1337,6 +1373,13 @@ func buildScheduledPTZBody(operation gbmodels.GbPTZOperation) ([]byte, error) {
 
 func (s *Scheduler) persistAttemptOutcome(ctx context.Context, attempt gbmodels.GbPTZOperationAttempt, result uac.TrackedMessageResult, sendErr error, observedAt time.Time, timing *schedulerSendTiming) error {
 	return schedulerTransaction(ctx, s.db, func(tx *gorm.DB) (persistErr error) {
+		var settleOperationID uint
+		defer func() {
+			if persistErr != nil || settleOperationID == 0 {
+				return
+			}
+			persistErr = playauth.SettlePTZParent(tx, settleOperationID, observedAt)
+		}()
 		var currentAttempt gbmodels.GbPTZOperationAttempt
 		if err := tx.First(&currentAttempt, attempt.ID).Error; err != nil {
 			return err
@@ -1376,6 +1419,7 @@ func (s *Scheduler) persistAttemptOutcome(ctx context.Context, attempt gbmodels.
 		if err := tx.First(&operation, currentAttempt.OperationID).Error; err != nil {
 			return err
 		}
+		settleOperationID = operation.ID
 		if timing != nil {
 			// Only narrow an existing ownership lease; never revive an expired
 			// owner or overwrite another attempt's scheduling state.

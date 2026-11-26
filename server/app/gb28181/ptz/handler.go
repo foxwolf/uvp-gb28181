@@ -348,7 +348,13 @@ func applyPTZResponseTransition(tx *gorm.DB, operation gbmodels.GbPTZOperation, 
 	}
 
 	result := ptzResponseOperationUpdate(tx, operation, completedAt).Updates(updates)
-	return result.RowsAffected == 1, result.Error
+	if result.Error != nil || result.RowsAffected != 1 {
+		return result.RowsAffected == 1, result.Error
+	}
+	if err := playauth.SettlePTZParent(tx, operation.ID, completedAt); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) applyDeviceControlResponse(ctx context.Context, operation gbmodels.GbPTZOperation, callID, cseq string, body []byte) error {

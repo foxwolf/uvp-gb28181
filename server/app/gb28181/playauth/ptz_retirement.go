@@ -90,7 +90,10 @@ func (s *DeviceOperationIntentStore) RetirePTZAttempt(ctx context.Context, expec
 		if err := lockedModel(tx, &parent, parent.TableName()).First(&parent, "operation_id=?", id.OperationID).Error; err != nil {
 			return err
 		}
-		if !validIntentRow(parent) || parent.DeviceOperationIntentIdentity != id || parent.State != IntentDispatched {
+		// A finished parent may already be settled. Re-reading a retirement
+		// certificate does not need the parent to stay dispatched; the first
+		// write still does, and that check happens after the attempt is loaded.
+		if !validIntentRow(parent) || parent.DeviceOperationIntentIdentity != id || (parent.State != IntentDispatched && parent.State != IntentSettled) {
 			return ErrDeviceIntentConflict
 		}
 		var op gbmodels.GbPTZOperation
@@ -124,6 +127,9 @@ func (s *DeviceOperationIntentStore) RetirePTZAttempt(ctx context.Context, expec
 				return ErrDeviceIntentConflict
 			}
 			return nil
+		}
+		if parent.State != IntentDispatched {
+			return ErrDeviceIntentConflict
 		}
 		if actual.Status != gbmodels.PTZOperationAttemptDispatching && actual.Status != gbmodels.PTZOperationAttemptUnknown {
 			return ErrDeviceIntentConflict

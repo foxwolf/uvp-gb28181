@@ -112,6 +112,8 @@ func (f *fixture) insertOlderIntent(t *testing.T, id string, epoch int64, state 
 		version, dispatchAt = 2, now
 	case playauth.IntentCancelled:
 		version, cancelledAt = 2, now
+	case playauth.IntentSettled:
+		version, dispatchAt = 3, now
 	}
 	require.NoError(t, f.db.Exec(`INSERT INTO gb_device_operation_intent
 		(operation_id, device_pk, device_code, target_scope, target_pk, target_code,
@@ -144,6 +146,15 @@ func TestReconcilerKeepsGateClosedWhileDurableWorkIsUnsettled(t *testing.T) {
 			require.EqualValues(t, 1, f.watermark(t, gateDeviceCode))
 		})
 	}
+}
+
+func TestReconcilerOpensGateWhenOlderIntentIsSettled(t *testing.T) {
+	f := newFixture(t, "1|"+gateDeviceCode+"|2|1")
+	f.insertOlderIntent(t, fmt.Sprintf("%032d", 7), 1, playauth.IntentSettled)
+	stats, err := f.reconciler(t).Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, Stats{Examined: 1, Completed: 1}, stats)
+	require.EqualValues(t, 2, f.watermark(t, gateDeviceCode))
 }
 
 func TestReconcilerKeepsGateClosedWhenLiveMediaCannotSettle(t *testing.T) {

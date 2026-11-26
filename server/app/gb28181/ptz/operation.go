@@ -578,7 +578,10 @@ func (s *Service) ApplyResponse(ctx context.Context, response Response) (gbmodel
 			)
 		}
 		result := update.Updates(updates)
-		return result.Error
+		if result.Error != nil {
+			return result.Error
+		}
+		return playauth.SettlePTZParent(tx, operation.ID, completedAt)
 	}); err != nil {
 		return operation, true, err
 	}
@@ -598,6 +601,9 @@ func (s *Service) MarkTimeout(ctx context.Context, operationID, message string) 
 	if err := s.db.WithContext(ctx).Model(&gbmodels.GbPTZOperation{}).
 		Where("id = ? AND status IN ?", operation.ID, []gbmodels.PTZOperationStatus{gbmodels.PTZOperationQueued, gbmodels.PTZOperationSent}).
 		Updates(map[string]interface{}{"status": gbmodels.PTZOperationTimeout, "error_message": message, "completed_at": completedAt}).Error; err != nil {
+		return operation, err
+	}
+	if err := playauth.SettlePTZParent(s.db.WithContext(ctx), operation.ID, completedAt); err != nil {
 		return operation, err
 	}
 	updated, err := s.GetOperation(ctx, operationID)

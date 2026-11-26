@@ -22,8 +22,10 @@ type playbackRecoveryScan struct {
 
 // RecoverPlaybackIntents executes one bounded page outside SQL transactions.
 // The composition root must share this UAC/barrier; this is not a multi-API
-// lease. Every dispatched intent stays pending until all adapters and the
-// independent historical coverage authority prove completion.
+// lease. Dispatched playback and download intents stay pending until all
+// adapters and the independent historical coverage authority prove completion.
+// Other kinds are not playback-dialog cleanup. Counting them only advances
+// the keyset so a mixed page cannot stall or be logged as an incomplete playback.
 func (u *UAC) RecoverPlaybackIntents(ctx context.Context, store *playauth.DeviceOperationIntentStore, barrier *playauth.DeviceOperationBarrier, devicePK int64, deviceCode string, beforeEpoch int64, afterID string, limit int) (PlaybackRecoveryPage, error) {
 	var page PlaybackRecoveryPage
 	if ctx == nil || u == nil || store == nil || devicePK <= 0 {
@@ -63,6 +65,9 @@ func (u *UAC) RecoverPlaybackIntents(ctx context.Context, store *playauth.Device
 		}
 		page.Scanned++
 		page.NextAfter = row.OperationID
+		if !playbackIntentKind(row.Kind) {
+			continue
+		}
 		if row.State == playauth.IntentReserved {
 			err = store.CancelReserved(ctx, row.OperationID, row.RowVersion)
 			if err == nil {
