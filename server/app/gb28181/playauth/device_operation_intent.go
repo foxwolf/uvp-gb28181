@@ -16,7 +16,12 @@ const (
 	// Dispatched means the operation MAY have produced external side effects.
 	// Neither restart nor a missing response makes this state safe to cancel.
 	IntentDispatched = "dispatched"
-	IntentCancelled  = "cancelled"
+	// Cancelled is only a never-dispatched reservation. dispatch_started_at
+	// must stay empty: the command is not known to have reached the device.
+	IntentCancelled = "cancelled"
+	// Settled is the terminal state of a dispatched intent whose business
+	// outcome is finished. It does not deny that side effects happened.
+	IntentSettled = "settled"
 )
 
 var (
@@ -193,12 +198,49 @@ func (s *DeviceOperationIntentStore) CancelReserved(ctx context.Context, operati
 	return nil
 }
 
+// SettleDispatched is a one-way CAS from dispatched to settled.
+// It grants no new effect and does not decide that the business outcome is
+// finished: callers (PTZ write-back and backfill) must establish that first.
+// Reserved rows stay on CancelReserved; this method refuses them.
+func (s *DeviceOperationIntentStore) SettleDispatched(ctx context.Context, operationID string, version int64) error {
+	if !s.available(ctx) {
+		return ErrDeviceIntentUnavailable
+	}
+	if !validIntentID(operationID) || version <= 0 || version == math.MaxInt64 {
+		return ErrDeviceIntentInvalid
+	}
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parent DeviceOperationIntent
+		if err := tx.First(&parent, "operation_id = ?", operationID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrDeviceIntentConflict
+			}
+			return err
+		}
+		if !validIntentRow(parent) || parent.State != IntentDispatched || parent.RowVersion != version {
+			return ErrDeviceIntentConflict
+		}
+		return settleDispatchedCAS(tx, operationID, version, settleTimestamp(parent, time.Now().UTC()), false)
+	})
+	if err != nil {
+		return normalizeIntentError(err)
+	}
+	return nil
+}
+
 // ListUnsettled uses keyset pagination. An empty result carries NO historical
 // coverage or device-completion evidence. Recovery must never dispatch rows.
 func (s *DeviceOperationIntentStore) ListUnsettled(ctx context.Context, pk int64, code string, beforeEpoch int64, afterID string, limit int) ([]DeviceOperationIntent, error) {
 	if !s.available(ctx) {
 		return nil, ErrDeviceIntentUnavailable
 	}
+	if pk <= 0 || !validGBID(code) || beforeEpoch <= 0 || (afterID != "" && !validIntentID(afterID)) {
+		return nil, ErrDeviceIntentInvalid
+	}
+	return s.listIntentPage(ctx, pk, code, beforeEpoch, afterID, limit, nil)
+}
+
+func (s *DeviceOperationIntentStore) listIntentPage(ctx context.Context, pk int64, code string, beforeEpoch int64, afterID string, limit int, kinds []string) ([]DeviceOperationIntent, error) {
 	if pk <= 0 || !validGBID(code) || beforeEpoch <= 0 || (afterID != "" && !validIntentID(afterID)) {
 		return nil, ErrDeviceIntentInvalid
 	}
@@ -209,7 +251,12 @@ func (s *DeviceOperationIntentStore) ListUnsettled(ctx context.Context, pk int64
 		limit = 100
 	}
 	var rows []DeviceOperationIntent
-	query := s.db.WithContext(ctx).Where("device_pk = ? AND device_code = ? AND device_epoch < ? AND state <> ?", pk, code, beforeEpoch, IntentCancelled)
+	// cancelled and settled are both finished. A settled intent was dispatched;
+	// it no longer blocks the cleanup watermark.
+	query := s.db.WithContext(ctx).Where("device_pk = ? AND device_code = ? AND device_epoch < ? AND state NOT IN ?", pk, code, beforeEpoch, []string{IntentCancelled, IntentSettled})
+	if len(kinds) > 0 {
+		query = query.Where("kind IN ?", kinds)
+	}
 	if afterID != "" {
 		query = query.Where("operation_id > ?", afterID)
 	}
@@ -326,6 +373,9 @@ func validIntentRow(row DeviceOperationIntent) bool {
 		return row.RowVersion >= 2 && validTime(row.DispatchStartedAt) && row.CancelledAt == nil
 	case IntentCancelled:
 		return row.RowVersion >= 2 && row.DispatchStartedAt == nil && validTime(row.CancelledAt)
+	case IntentSettled:
+		// Dispatched is at least version 2; settlement increments it once.
+		return row.RowVersion >= 3 && validTime(row.DispatchStartedAt) && row.CancelledAt == nil
 	}
 	return false
 }

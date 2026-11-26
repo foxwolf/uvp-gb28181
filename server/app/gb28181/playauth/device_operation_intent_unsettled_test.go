@@ -85,6 +85,19 @@ func TestHasUnsettledBeforeIsExactOverTheWholeSet(t *testing.T) {
 		require.False(t, unsettled)
 	})
 
+	t.Run("dispatched intent that later settled does not block", func(t *testing.T) {
+		db, store := newUnsettledFixture(t, 2, 1)
+		now := time.Now().UTC().Truncate(time.Second)
+		insertIntent(t, db, strings.Repeat("e", 32), 1, IntentSettled, 3, now, nil)
+		unsettled, err := store.HasUnsettledBefore(ctx, unsettledDeviceCode, 2)
+		require.NoError(t, err)
+		require.False(t, unsettled, "settled means the dispatched effect is finished")
+		insertIntent(t, db, strings.Repeat("f", 32), 1, IntentDispatched, 2, now, nil)
+		unsettled, err = store.HasUnsettledBefore(ctx, unsettledDeviceCode, 2)
+		require.NoError(t, err)
+		require.True(t, unsettled, "a sibling that is still dispatched keeps the gate closed")
+	})
+
 	t.Run("current epoch intent is not older work", func(t *testing.T) {
 		db, store := newUnsettledFixture(t, 2, 1)
 		insertIntent(t, db, strings.Repeat("d", 32), 2, IntentReserved, 1, nil, nil)

@@ -6287,7 +6287,7 @@
         },
         {
           "name": "ck_device_intent_phase",
-          "clause": "((`updated_at` >= `created_at`) and (((`state` = _ascii'reserved') and (`row_version` = 1) and (`dispatch_started_at` is null) and (`cancelled_at` is null)) or ((`state` = _ascii'dispatched') and (`row_version` >= 2) and (`cancelled_at` is null) and (`dispatch_started_at` is not null) and (`dispatch_started_at` >= `created_at`) and (`dispatch_started_at` <= `updated_at`)) or ((`state` = _ascii'cancelled') and (`row_version` >= 2) and (`dispatch_started_at` is null) and (`cancelled_at` is not null) and (`cancelled_at` >= `created_at`) and (`cancelled_at` <= `updated_at`))))"
+          "clause": "((`updated_at` >= `created_at`) and (((`state` = _ascii'reserved') and (`row_version` = 1) and (`dispatch_started_at` is null) and (`cancelled_at` is null)) or ((`state` = _ascii'dispatched') and (`row_version` >= 2) and (`cancelled_at` is null) and (`dispatch_started_at` is not null) and (`dispatch_started_at` >= `created_at`) and (`dispatch_started_at` <= `updated_at`)) or ((`state` = _ascii'cancelled') and (`row_version` >= 2) and (`dispatch_started_at` is null) and (`cancelled_at` is not null) and (`cancelled_at` >= `created_at`) and (`cancelled_at` <= `updated_at`)) or ((`state` = _ascii'settled') and (`row_version` >= 3) and (`cancelled_at` is null) and (`dispatch_started_at` is not null) and (`dispatch_started_at` >= `created_at`) and (`dispatch_started_at` <= `updated_at`))))"
         },
         {
           "name": "ck_device_intent_rtp_size",
